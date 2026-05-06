@@ -1,7 +1,6 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import Anthropic from '@anthropic-ai/sdk';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -11,66 +10,101 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-if (!process.env.ANTHROPIC_API_KEY) {
-  console.error('❌ Falta ANTHROPIC_API_KEY en el archivo .env');
-  process.exit(1);
-}
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
-// Endpoint de refresco de precios
+// ====== Crypto via CoinGecko (gratis, sin key) ======
+async function fetchCryptoPrices(symbols) {
+  if (symbols.length === 0) return {};
+  const symbolsParam = symbols.map((s) => s.toLowerCase()).join(',');
+  const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=eur&symbols=${encodeURIComponent(symbolsParam)}&per_page=250&order=market_cap_desc`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
+  const data = await res.json();
+  // Si un símbolo tiene varias monedas, nos quedamos con la de mayor market cap (vienen ordenadas).
+  const out = {};
+  for (const coin of data) {
+    const sym = coin.symbol?.toUpperCase();
+    if (sym && symbols.includes(sym) && !out[sym] && typeof coin.current_price === 'number') {
+      out[sym] = coin.current_price;
+    }
+  }
+  return out;
+}
+
+// ====== FX via Frankfurter (BCE, gratis, sin key) ======
+async function fetchFxRates(currencies) {
+  const filtered = [...new Set(currencies.filter((c) => c && c !== 'EUR'))];
+  if (filtered.length === 0) return {};
+  const url = `https://api.frankfurter.dev/v1/latest?base=EUR&symbols=${encodeURIComponent(filtered.join(','))}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Frankfurter HTTP ${res.status}`);
+  const data = await res.json();
+  const rates = data.rates || {};
+  const out = {};
+  for (const [k, v] of Object.entries(rates)) {
+    if (typeof v === 'number' && v > 0) out[k] = v;
+  }
+  return out;
+}
+
+// ====== Stocks via Yahoo Finance (gratis, sin key) ======
+// Mapeo de sufijos amistosos → sufijos Yahoo
+const SUFFIX_MAP = { '.UK': '.L' };
+function toYahooTicker(t) {
+  for (const [from, to] of Object.entries(SUFFIX_MAP)) {
+    if (t.endsWith(from)) return t.slice(0, -from.length) + to;
+  }
+  return t;
+}
+
+async function fetchStockPrice(ticker) {
+  const yahooTicker = toYahooTicker(ticker);
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooTicker)}`;
+  const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (PortfolioTracker)' } });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const meta = data?.chart?.result?.[0]?.meta;
+  const price = meta?.regularMarketPrice;
+  if (typeof price !== 'number' || price <= 0) return null;
+  return { price, currency: meta.currency || 'USD' };
+}
+
+async function fetchAllStocks(tickers) {
+  if (tickers.length === 0) return {};
+  const results = await Promise.all(
+    tickers.map(async (t) => {
+      try {
+        const data = await fetchStockPrice(t);
+        return [t, data];
+      } catch {
+        return [t, null];
+      }
+    })
+  );
+  const out = {};
+  for (const [t, data] of results) {
+    if (data) out[t] = data;
+  }
+  return out;
+}
+
+// ====== Endpoint principal ======
 app.post('/api/refresh-prices', async (req, res) => {
   try {
     const { cryptoSymbols = [], stockTickers = [], fxNeeded = [] } = req.body;
-
-    if (cryptoSymbols.length === 0 && stockTickers.length === 0 && fxNeeded.length === 0) {
-      return res.json({ crypto: {}, stocks: {}, fx: {} });
-    }
-
-    const prompt = `Necesito los precios actuales (lo más recientes posible). Busca en la web los siguientes datos y responde EXCLUSIVAMENTE con un objeto JSON válido, sin markdown, sin texto adicional, sin backticks.
-
-${cryptoSymbols.length > 0 ? `CRIPTOMONEDAS (precio en EUR): ${cryptoSymbols.join(', ')}` : ''}
-${stockTickers.length > 0 ? `ACCIONES (precio en su divisa de cotización): ${stockTickers.join(', ')}. Para tickers con sufijo (.MC=Madrid, .UK=Londres, .DE=Frankfurt, .PA=París) usa la divisa local. Sin sufijo asume USD.` : ''}
-${fxNeeded.length > 0 ? `TIPOS DE CAMBIO (cuántas unidades de cada divisa equivalen a 1 EUR): ${fxNeeded.join(', ')}` : ''}
-
-Formato JSON exacto:
-{
-  "crypto": { "BTC": 90000.50, "ETH": 3200.10 },
-  "stocks": { "AAPL": { "price": 230.50, "currency": "USD" } },
-  "fx": { "USD": 1.08, "GBP": 0.85 }
-}
-
-Si no encuentras un precio concreto, omítelo del JSON. Solo el JSON, nada más.`;
-
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
-      messages: [{ role: 'user', content: prompt }],
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-    });
-
-    const fullText = (response.content || [])
-      .filter((b) => b.type === 'text')
-      .map((b) => b.text)
-      .join('\n');
-
-    let jsonStr = fullText.trim();
-    jsonStr = jsonStr.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/```\s*$/, '');
-    const firstBrace = jsonStr.indexOf('{');
-    const lastBrace = jsonStr.lastIndexOf('}');
-    if (firstBrace >= 0 && lastBrace > firstBrace) {
-      jsonStr = jsonStr.slice(firstBrace, lastBrace + 1);
-    }
-
-    const parsed = JSON.parse(jsonStr);
-    res.json({
-      crypto: parsed.crypto || {},
-      stocks: parsed.stocks || {},
-      fx: parsed.fx || {},
-    });
+    const [crypto, stocks, fx] = await Promise.all([
+      fetchCryptoPrices(cryptoSymbols).catch((e) => {
+        console.error('Crypto error:', e.message);
+        return {};
+      }),
+      fetchAllStocks(stockTickers),
+      fetchFxRates(fxNeeded).catch((e) => {
+        console.error('FX error:', e.message);
+        return {};
+      }),
+    ]);
+    res.json({ crypto, stocks, fx });
   } catch (err) {
     console.error('Error refresh-prices:', err);
     res.status(500).json({ error: err.message || 'Error desconocido' });
@@ -85,4 +119,5 @@ app.get('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`✓ Backend escuchando en http://localhost:${PORT}`);
+  console.log('  Fuentes: CoinGecko (cripto) · Yahoo Finance (acciones) · Frankfurter (FX)');
 });
